@@ -1,0 +1,14 @@
+# Nulla Light Client — Python dependencies
+
+# Core cryptography (Ed25519, X25519, AES-GCM, PBKDF2, HKDF)
+cryptography>=42.0.0
+
+# BIP39 mnemonic generation and validation
+mnemonic>=0.21
+
+# HTTP client for node communication
+requests>=2.31.0
+
+# Web server (for UI)
+flask>=3.0.0
+flask-cors>=4.0.0
