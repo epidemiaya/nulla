@@ -1,14 +1,20 @@
-# Nulla Light Client — Python dependencies
+# Nulla — Bitcoin Light Wallet dependencies
 
-# Core cryptography (Ed25519, X25519, AES-GCM, PBKDF2, HKDF)
-cryptography>=42.0.0
+# secp256k1 (libsecp256k1 bindings — same as Bitcoin Core)
+coincurve>=14.0.0
 
-# BIP39 mnemonic generation and validation
+# BIP39 mnemonic
 mnemonic>=0.21
 
-# HTTP client for node communication
-requests>=2.31.0
+# Base58Check encoding (addresses)
+base58>=2.1.1
 
-# Web server (for UI)
+# AES-256-GCM keystore encryption
+cryptography>=42.0.0
+
+# Web server
 flask>=3.0.0
 flask-cors>=4.0.0
+
+# HTTP (fallback + fee APIs)
+requests>=2.31.0

@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Nulla Light Client — Local Server
-
-Serves the React UI at http://localhost:7421
-and provides a JSON API for wallet operations.
-
-Run: python nulla_server.py [--port 7421] [--node https://lac-beta.uk]
+Nulla — Local Server
+Flask JSON API + React SPA
+Binds to 127.0.0.1 only (localhost-only, never exposed to network).
+Run: python nulla_server.py [--port 7421] [--testnet]
 """
 
 import os
-import sys
 import json
 import time
 import secrets
@@ -18,92 +15,120 @@ import webbrowser
 import argparse
 from pathlib import Path
 from functools import wraps
-from typing import Optional
 
 from flask import Flask, jsonify, request, send_from_directory, session
 
 from nulla_core import (
     NullaWallet, NullaError, KeystoreError, WalletError,
-    validate_key_id, format_lac
+    validate_address, format_btc
 )
-from nulla_node import LACNodeClient, NodeError, NodeConnectionError
+from nulla_electrum import ElectrumClient, ElectrumError
+from nulla_tx import build_send_tx, UTXO, estimate_fee
 
-# ── App setup ──────────────────────────────────────────────────────────────────
+try:
+    from flask_cors import CORS
+    _HAS_CORS = True
+except ImportError:
+    _HAS_CORS = False
+
+# ── App config ────────────────────────────────────────────────────────────────
 
 app = Flask(__name__, static_folder="ui/dist", static_url_path="")
 app.secret_key = secrets.token_hex(32)
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config.update(
+    SESSION_COOKIE_HTTPONLY  = True,
+    SESSION_COOKIE_SAMESITE  = "Lax",
+    SESSION_COOKIE_SECURE    = False,  # localhost only
+    PERMANENT_SESSION_LIFETIME = 3600,
+)
 
-# Allow CORS only from localhost (dev mode)
-try:
-    from flask_cors import CORS
+if _HAS_CORS:
     CORS(app, origins=["http://localhost:5173", "http://localhost:7421"],
          supports_credentials=True)
-except ImportError:
-    pass
 
 DEFAULT_KEYSTORE = str(Path.home() / ".nulla" / "wallet.nulla")
-DEFAULT_NODE = "https://lac-beta.uk"
 
-# ── Global state ───────────────────────────────────────────────────────────────
-_wallet: Optional[NullaWallet] = None
-_node: LACNodeClient = LACNodeClient(DEFAULT_NODE)
+# Global state
+_wallet: NullaWallet = None
+_electrum: ElectrumClient = None
+_network: str = "mainnet"
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def err(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": str(msg)}), code
 
-def ok_json(**data):
-    return jsonify({"ok": True, **data})
+def ok(**kw):
+    return jsonify({"ok": True, **kw})
 
 def require_unlocked(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         if _wallet is None or not _wallet._unlocked:
-            return err("Wallet is locked", 401)
+            return err("Wallet locked", 401)
         return f(*args, **kwargs)
     return wrapper
 
-def keystore_path() -> str:
-    return session.get("keystore_path", DEFAULT_KEYSTORE)
+def _get_electrum() -> ElectrumClient:
+    global _electrum
+    if _electrum is None:
+        _electrum = ElectrumClient(network=_network)
+    return _electrum
+
+def _all_utxos_for_wallet() -> list:
+    """Fetch and assemble UTXOs for all wallet addresses."""
+    el   = _get_electrum()
+    utxo_list = []
+    for addr in _wallet.all_addresses():
+        try:
+            raw_utxos = el.get_utxos(addr.electrum_scripthash)
+            for u in raw_utxos:
+                utxo_list.append(UTXO(
+                    txid    = u["tx_hash"],
+                    vout    = u["tx_pos"],
+                    value   = u["value"],
+                    address = addr,
+                    height  = u.get("height", 0),
+                ))
+        except ElectrumError:
+            pass
+    return utxo_list
 
 
-# ── API — system ───────────────────────────────────────────────────────────────
+# ── API: system ───────────────────────────────────────────────────────────────
 
 @app.route("/api/status")
 def api_status():
-    return ok_json(
-        wallet_exists=Path(keystore_path()).exists(),
-        wallet_unlocked=bool(_wallet and _wallet._unlocked),
-        node_url=_node.node_url,
-        version="1.0.0",
+    ks = session.get("keystore_path", DEFAULT_KEYSTORE)
+    return ok(
+        wallet_exists   = Path(ks).exists(),
+        wallet_unlocked = bool(_wallet and _wallet._unlocked),
+        network         = _network,
+        version         = "1.0.0",
     )
 
 
-# ── API — wallet lifecycle ─────────────────────────────────────────────────────
+# ── API: wallet lifecycle ──────────────────────────────────────────────────────
 
 @app.route("/api/wallet/create", methods=["POST"])
 def api_create():
     global _wallet
-    d = request.json or {}
-    password = d.get("password", "")
-    if len(password) < 8:
+    d  = request.json or {}
+    pw = d.get("password", "")
+    if len(pw) < 8:
         return err("Password must be at least 8 characters")
-
     ks_path = d.get("keystore", DEFAULT_KEYSTORE)
     try:
-        wallet = NullaWallet.generate(password)
+        w = NullaWallet.generate(pw, network=_network)
         Path(ks_path).parent.mkdir(parents=True, exist_ok=True)
-        wallet.save(ks_path, password)
-        _wallet = wallet
+        w.save(ks_path, pw)
+        _wallet = w
         session["keystore_path"] = ks_path
-        return ok_json(
-            key_id=wallet.key_id,
-            mnemonic=wallet.mnemonic,
-            accounts=wallet.all_accounts(),
+        return ok(
+            address  = w.address,
+            mnemonic = w.mnemonic,
+            accounts = w.all_accounts_summary(),
         )
     except Exception as e:
         return err(str(e))
@@ -112,22 +137,19 @@ def api_create():
 @app.route("/api/wallet/import", methods=["POST"])
 def api_import():
     global _wallet
-    d = request.json or {}
+    d        = request.json or {}
     mnemonic = d.get("mnemonic", "").strip()
-    password = d.get("password", "")
-    if not mnemonic:
-        return err("Mnemonic required")
-    if not password:
-        return err("Password required")
-
+    pw       = d.get("password", "")
+    if not mnemonic: return err("Mnemonic required")
+    if len(pw) < 8:  return err("Min 8 characters")
     ks_path = d.get("keystore", DEFAULT_KEYSTORE)
     try:
-        wallet = NullaWallet.from_mnemonic(mnemonic, password)
+        w = NullaWallet.from_mnemonic(mnemonic, pw, network=_network)
         Path(ks_path).parent.mkdir(parents=True, exist_ok=True)
-        wallet.save(ks_path, password)
-        _wallet = wallet
+        w.save(ks_path, pw)
+        _wallet = w
         session["keystore_path"] = ks_path
-        return ok_json(key_id=wallet.key_id, accounts=wallet.all_accounts())
+        return ok(address=w.address, accounts=w.all_accounts_summary())
     except WalletError as e:
         return err(str(e))
 
@@ -135,18 +157,16 @@ def api_import():
 @app.route("/api/wallet/unlock", methods=["POST"])
 def api_unlock():
     global _wallet
-    d = request.json or {}
-    password = d.get("password", "")
-    ks_path = d.get("keystore", DEFAULT_KEYSTORE)
+    d  = request.json or {}
+    pw = d.get("password", "")
+    ks = d.get("keystore", session.get("keystore_path", DEFAULT_KEYSTORE))
     try:
-        wallet = NullaWallet.load(ks_path, password)
-        _wallet = wallet
-        session["keystore_path"] = ks_path
-        return ok_json(key_id=wallet.key_id)
+        w = NullaWallet.load(ks, pw)
+        _wallet = w
+        session["keystore_path"] = ks
+        return ok(address=w.address, network=w.network)
     except KeystoreError as e:
         return err(str(e), 401)
-    except FileNotFoundError:
-        return err("Keystore not found", 404)
 
 
 @app.route("/api/wallet/lock", methods=["POST"])
@@ -155,199 +175,272 @@ def api_lock():
     if _wallet:
         _wallet.lock()
         _wallet = None
-    return ok_json()
+    return ok()
 
 
 @app.route("/api/wallet/info")
 @require_unlocked
-def api_wallet_info():
-    return ok_json(
-        key_id=_wallet.key_id,
-        accounts=_wallet.all_accounts(),
-        metadata=_wallet.metadata,
+def api_info():
+    return ok(
+        address  = _wallet.address,
+        network  = _wallet.network,
+        accounts = _wallet.all_accounts_summary(),
+        metadata = _wallet.metadata,
     )
 
 
-# ── API — balance & transactions ───────────────────────────────────────────────
+# ── API: balance ──────────────────────────────────────────────────────────────
 
 @app.route("/api/balance")
 @require_unlocked
 def api_balance():
     try:
-        result = _node.get_balance(_wallet.key_id)
-        username = _node.get_username(_wallet.key_id)
-        return ok_json(
-            key_id=_wallet.key_id,
-            balance=result["balance"],
-            pending=result.get("pending", 0),
-            stash=result.get("stash", 0),
-            level=result.get("level", 0),
-            username=username,
+        el = _get_electrum()
+        confirmed = 0
+        unconfirmed = 0
+        for addr in _wallet.all_addresses():
+            try:
+                b = el.get_balance(addr.electrum_scripthash)
+                confirmed   += b["confirmed"]
+                unconfirmed += b["unconfirmed"]
+            except ElectrumError:
+                pass
+        return ok(
+            confirmed   = confirmed,
+            unconfirmed = unconfirmed,
+            total       = confirmed + unconfirmed,
+            formatted   = format_btc(confirmed + unconfirmed),
+            address     = _wallet.address,
         )
-    except NodeError as e:
+    except ElectrumError as e:
         return err(str(e))
 
+
+# ── API: UTXOs ────────────────────────────────────────────────────────────────
+
+@app.route("/api/utxos")
+@require_unlocked
+def api_utxos():
+    try:
+        utxos = _all_utxos_for_wallet()
+        return ok(utxos=[{
+            "txid":    u.txid,
+            "vout":    u.vout,
+            "value":   u.value,
+            "address": u.address.address,
+            "height":  u.height,
+            "type":    u.address.addr_type,
+        } for u in utxos])
+    except ElectrumError as e:
+        return err(str(e))
+
+
+# ── API: transactions ─────────────────────────────────────────────────────────
 
 @app.route("/api/transactions")
 @require_unlocked
 def api_transactions():
-    limit = int(request.args.get("limit", 50))
-    offset = int(request.args.get("offset", 0))
+    limit  = int(request.args.get("limit", 25))
     try:
-        txs = _node.get_transactions(_wallet.key_id, limit=limit, offset=offset)
-        my_key = _wallet.key_id
-        for tx in txs:
-            tx_to = tx.get("to", tx.get("recipient", ""))
-            tx["direction"] = "in" if my_key[:16] in (tx_to or "") else "out"
-        return ok_json(transactions=txs)
-    except NodeError as e:
+        el          = _get_electrum()
+        my_addrs    = {a.address for a in _wallet.all_addresses()}
+        scripthashes= [a.electrum_scripthash for a in _wallet.all_addresses()]
+        history     = el.get_history_multi(scripthashes)[:limit]
+
+        result = []
+        for item in history:
+            txid = item["tx_hash"]
+            # Try to get tx details for amount
+            try:
+                raw = el.get_transaction(txid, verbose=True)
+                # Parse outputs
+                total_out_to_us = 0
+                total_in_from_us = 0
+                if isinstance(raw, dict):
+                    for vout in raw.get("vout", []):
+                        spk  = vout.get("scriptPubKey", {})
+                        addr = spk.get("address") or (spk.get("addresses") or [None])[0]
+                        if addr and addr in my_addrs:
+                            val = int(vout.get("value", 0) * 1e8)
+                            total_out_to_us += val
+                direction = "in" if total_out_to_us > 0 else "out"
+                result.append({
+                    "txid":      txid,
+                    "height":    item.get("height", 0),
+                    "confirmed": item.get("height", 0) > 0,
+                    "amount":    total_out_to_us,
+                    "direction": direction,
+                })
+            except Exception:
+                result.append({
+                    "txid":      txid,
+                    "height":    item.get("height", 0),
+                    "confirmed": item.get("height", 0) > 0,
+                    "amount":    0,
+                    "direction": "unknown",
+                })
+
+        return ok(transactions=result)
+    except ElectrumError as e:
         return err(str(e))
 
+
+# ── API: fee estimate ─────────────────────────────────────────────────────────
+
+@app.route("/api/fee")
+def api_fee():
+    blocks = int(request.args.get("blocks", 3))
+    try:
+        el       = _get_electrum()
+        fee_rate = el.estimate_fee(blocks)
+        return ok(fee_rate=fee_rate, blocks=blocks, unit="sat/vbyte")
+    except ElectrumError as e:
+        return err(str(e))
+
+
+# ── API: send ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/send", methods=["POST"])
 @require_unlocked
 def api_send():
-    d = request.json or {}
-    to = d.get("to", "").strip()
-    try:
-        amount = float(d.get("amount", 0))
-        fee = float(d.get("fee", 0.001))
-    except (TypeError, ValueError):
-        return err("Invalid amount or fee")
-
-    memo = d.get("memo", "")
+    d          = request.json or {}
+    to         = d.get("to", "").strip()
+    amount_btc = d.get("amount")
+    fee_rate   = int(d.get("fee_rate", 5))
 
     if not to:
-        return err("Recipient required")
-    if amount <= 0:
-        return err("Amount must be positive")
-
-    # Resolve username if needed
-    if not validate_key_id(to):
-        resolved = _node.resolve_username(to.lstrip("@"))
-        if not resolved:
-            return err(f"Unknown address or username: {to}")
-        to_key_id = resolved
-    else:
-        to_key_id = to
-
-    kp = _wallet.default_keypair()
-    tx_data = {
-        "from": kp.key_id,
-        "to": to_key_id,
-        "amount": amount,
-        "fee": fee,
-        "timestamp": int(time.time()),
-    }
-    if memo:
-        tx_data["memo"] = memo
-
-    signature = _wallet.sign_transaction(tx_data)
+        return err("Recipient address required")
+    if not validate_address(to, _wallet.network):
+        return err(f"Invalid Bitcoin address: {to}")
 
     try:
-        result = _node.send_transaction(
-            from_key_id=kp.key_id,
-            to_key_id=to_key_id,
-            amount=amount,
-            signature=signature,
-            fee=fee,
-            memo=memo,
+        amount_sats = int(float(amount_btc) * 1e8)
+    except (TypeError, ValueError):
+        return err("Invalid amount")
+
+    if amount_sats <= 0:
+        return err("Amount must be positive")
+
+    try:
+        # Get UTXOs
+        utxos = _all_utxos_for_wallet()
+        if not utxos:
+            return err("No spendable UTXOs")
+
+        change_addr = _wallet.change_address("p2wpkh")
+
+        raw_hex, fee_sats, change_sats = build_send_tx(
+            all_utxos      = utxos,
+            to_address     = to,
+            amount_sats    = amount_sats,
+            change_address = change_addr,
+            fee_rate       = fee_rate,
         )
-        return ok_json(result=result)
-    except NodeError as e:
+
+        # Broadcast
+        el   = _get_electrum()
+        txid = el.broadcast(raw_hex)
+
+        return ok(
+            txid       = txid,
+            amount     = amount_sats,
+            fee        = fee_sats,
+            change     = change_sats,
+            formatted  = format_btc(amount_sats),
+        )
+    except Exception as e:
         return err(str(e))
 
 
-# ── API — node ─────────────────────────────────────────────────────────────────
+# ── API: preview transaction (without broadcast) ──────────────────────────────
+
+@app.route("/api/send/preview", methods=["POST"])
+@require_unlocked
+def api_send_preview():
+    """Returns fee estimate before confirming send."""
+    d          = request.json or {}
+    to         = d.get("to", "").strip()
+    amount_btc = d.get("amount")
+    fee_rate   = int(d.get("fee_rate", 5))
+
+    if not to or not amount_btc:
+        return err("Address and amount required")
+
+    try:
+        amount_sats = int(float(amount_btc) * 1e8)
+        utxos       = _all_utxos_for_wallet()
+        total_sats  = sum(u.value for u in utxos)
+
+        from nulla_tx import select_utxos
+        selected, fee = select_utxos(utxos, amount_sats, fee_rate)
+
+        return ok(
+            amount      = amount_sats,
+            fee         = fee,
+            total       = amount_sats + fee,
+            change      = sum(u.value for u in selected) - amount_sats - fee,
+            balance     = total_sats,
+            fee_rate    = fee_rate,
+            inputs_used = len(selected),
+        )
+    except Exception as e:
+        return err(str(e))
+
+
+# ── API: node ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/node/status")
 def api_node_status():
-    result = _node.test_connection()
-    return ok_json(**result)
-
-
-@app.route("/api/node/connect", methods=["POST"])
-def api_node_connect():
-    global _node
-    d = request.json or {}
-    url = d.get("url", "").strip()
-    if not url:
-        return err("URL required")
-    candidate = LACNodeClient(url)
-    result = candidate.test_connection()
-    if result["is_connected"]:
-        _node = candidate
-        return ok_json(**result)
-    return err(result.get("error", "Cannot connect"))
-
-
-# ── API — resolve & faucet ─────────────────────────────────────────────────────
-
-@app.route("/api/resolve/<username>")
-def api_resolve(username: str):
-    result = _node.resolve_username(username)
-    if result:
-        return ok_json(key_id=result)
-    return err(f"Username not found: {username}", 404)
-
-
-@app.route("/api/faucet", methods=["POST"])
-@require_unlocked
-def api_faucet():
     try:
-        result = _node.faucet(_wallet.key_id)
-        return ok_json(result=result)
-    except NodeError as e:
-        return err(str(e))
+        el     = _get_electrum()
+        result = el.test_connection()
+        return ok(**result)
+    except Exception as e:
+        return ok(connected=False, error=str(e))
 
 
-# ── Static / SPA ───────────────────────────────────────────────────────────────
+# ── Static SPA ────────────────────────────────────────────────────────────────
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
-def spa(path: str):
+def spa(path):
     dist = app.static_folder
     if path and Path(dist, path).is_file():
         return send_from_directory(dist, path)
     index = Path(dist, "index.html")
     if index.exists():
         return send_from_directory(dist, "index.html")
-    # Dev fallback: show helpful message
     return (
-        "<pre style='font-family:monospace;padding:2em'>"
-        "Nulla UI not built yet.\n\n"
-        "Run:\n"
-        "  cd ui && npm install && npm run build\n\n"
-        "Or for dev mode:\n"
-        "  cd ui && npm run dev\n"
-        "  (then open http://localhost:5173)\n"
+        "<pre style='font:13px monospace;padding:2em;background:#080808;color:#d4d4d4'>"
+        "Nulla UI not built.\n\n"
+        "Run:\n  cd ui && npm install && npm run build\n\n"
+        "Dev mode:\n  cd ui && npm run dev  (port 5173)\n"
         "</pre>"
     ), 200
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    global _node
+    global _network
 
-    parser = argparse.ArgumentParser(description="Nulla local server")
+    parser = argparse.ArgumentParser(description="Nulla Bitcoin Wallet")
     parser.add_argument("--port",       type=int, default=7421)
-    parser.add_argument("--node",       default=DEFAULT_NODE)
+    parser.add_argument("--host",       default="127.0.0.1")
+    parser.add_argument("--testnet",    action="store_true")
     parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--host",       default="127.0.0.1",
-                        help="Bind host (127.0.0.1 = localhost only)")
     args = parser.parse_args()
 
-    _node = LACNodeClient(args.node)
+    _network = "testnet" if args.testnet else "mainnet"
 
     print(f"""
   ╔╗╔╦ ╦╦  ╦  ╔═╗
   ║║║║ ║║  ║  ╠═╣
-  ╝╚╝╚═╝╩═╝╩═╝╩ ╩  LAC Light Wallet v1.0.0
-  ─────────────────────────────────────────
-  Server:   http://localhost:{args.port}
-  Node:     {args.node}
-  Wallet:   {DEFAULT_KEYSTORE}
+  ╝╚╝╚═╝╩═╝╩═╝╩ ╩  Bitcoin Light Wallet v1.0.0
+  ─────────────────────────────────────────────
+  UI:       http://localhost:{args.port}
+  Network:  {_network.upper()}
+  Keystore: {DEFAULT_KEYSTORE}
   Ctrl+C to stop
 """)
 

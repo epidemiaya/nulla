@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Nulla Light Client — CLI
+Nulla — Bitcoin Wallet CLI
 
 Usage:
-  nulla create               Create new wallet
-  nulla import [words...]    Import from mnemonic
-  nulla balance              Show balance
-  nulla send <to> <amount>   Send LAC
-  nulla receive              Show your address
-  nulla history              Transaction history
-  nulla node                 Node status
-  nulla faucet               Request testnet tokens
-  nulla lock                 Lock wallet (clear session)
+  nulla create             Create new wallet
+  nulla import [words...]  Restore from mnemonic
+  nulla balance            Show BTC balance
+  nulla receive            Show receive address
+  nulla send <to> <btc>    Send BTC
+  nulla utxos              List UTXOs
+  nulla history            Transaction history
+  nulla node               ElectrumX server status
+  nulla fee                Current fee estimate
+  nulla accounts           List all derived addresses
 
 Options:
-  --node URL        LAC node URL  [default: https://lac-beta.uk]
-  --keystore PATH   Keystore file [default: ~/.nulla/wallet.nulla]
+  --testnet     Use testnet (default: mainnet)
+  --keystore PATH
 """
 
 import sys
@@ -29,407 +30,305 @@ from typing import Optional
 
 from nulla_core import (
     NullaWallet, NullaError, KeystoreError, WalletError,
-    validate_key_id, format_lac
+    validate_address, format_btc
 )
-from nulla_node import LACNodeClient, NodeError, NodeConnectionError
+from nulla_electrum import ElectrumClient, ElectrumError
+from nulla_tx import build_send_tx, UTXO, DUST_LIMIT_P2WPKH
 
 DEFAULT_KEYSTORE = Path.home() / ".nulla" / "wallet.nulla"
-DEFAULT_NODE = "https://lac-beta.uk"
 
-# ── Terminal colors ────────────────────────────────────────────────────────────
 _NO_COLOR = not sys.stdout.isatty() or os.environ.get("NO_COLOR")
+def _c(code): return "" if _NO_COLOR else code
 
-def _c(code: str) -> str:
-    return "" if _NO_COLOR else code
+R  = _c("\033[0m");  B  = _c("\033[1m");   DIM = _c("\033[2m")
+GR = _c("\033[92m"); YL = _c("\033[93m");  CY  = _c("\033[96m")
+RD = _c("\033[91m"); OR = _c("\033[33m")
 
-R  = _c("\033[0m")
-B  = _c("\033[1m")
-DIM= _c("\033[2m")
-GR = _c("\033[92m")   # green
-YL = _c("\033[93m")   # yellow
-CY = _c("\033[96m")   # cyan
-RD = _c("\033[91m")   # red
-
-BANNER = f"""{CY}
+BANNER = f"""{OR}
   ╔╗╔╦ ╦╦  ╦  ╔═╗
   ║║║║ ║║  ║  ╠═╣
-  ╝╚╝╚═╝╩═╝╩═╝╩ ╩  {DIM}LAC Light Wallet v1.0.0{R}
+  ╝╚╝╚═╝╩═╝╩═╝╩ ╩  {DIM}Bitcoin Light Wallet v1.0.0{R}
 """
 
-def die(msg: str):
-    print(f"{RD}✗ {msg}{R}", file=sys.stderr)
-    sys.exit(1)
+def die(msg):  print(f"{RD}✗ {msg}{R}", file=sys.stderr); sys.exit(1)
+def ok(msg):   print(f"{GR}✓{R} {msg}")
+def info(msg): print(f"{CY}→{R} {msg}")
+def warn(msg): print(f"{YL}⚠{R} {msg}")
+def hr(w=54):  print(f"{DIM}{'─'*w}{R}")
 
-def ok(msg: str):
-    print(f"{GR}✓{R} {msg}")
-
-def info(msg: str):
-    print(f"{CY}→{R} {msg}")
-
-def warn(msg: str):
-    print(f"{YL}⚠{R} {msg}")
-
-def hr(width: int = 50):
-    print(f"{DIM}{'─' * width}{R}")
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def prompt_password(confirm: bool = False, prompt: str = "Password") -> str:
-    pw = getpass.getpass(f"  {prompt}: ")
-    if not pw:
-        die("Password cannot be empty")
+def prompt_pw(confirm=False, label="Password") -> str:
+    pw = getpass.getpass(f"  {label}: ")
+    if not pw: die("Password cannot be empty")
     if confirm:
-        pw2 = getpass.getpass("  Confirm password: ")
-        if pw != pw2:
-            die("Passwords do not match")
+        pw2 = getpass.getpass("  Confirm: ")
+        if pw != pw2: die("Passwords do not match")
     return pw
 
+def load_wallet(path: Path, pw=None) -> NullaWallet:
+    if not path.exists(): die(f"No keystore at {path}\n  Run: nulla create")
+    if pw is None: pw = prompt_pw()
+    try:    return NullaWallet.load(str(path), pw)
+    except KeystoreError as e: die(str(e))
 
-def load_wallet(path: Path, password: Optional[str] = None) -> NullaWallet:
-    if not path.exists():
-        die(f"No keystore at {path}\n  Run: nulla create")
-    if password is None:
-        password = prompt_password()
-    try:
-        return NullaWallet.load(str(path), password)
-    except KeystoreError as e:
-        die(str(e))
+def get_electrum(args) -> ElectrumClient:
+    network = "testnet" if args.testnet else "mainnet"
+    return ElectrumClient(network=network)
 
+def trunc(s, l=12, r=8):
+    return f"{s[:l]}…{s[-r:]}" if len(s) > l+r+3 else s
 
-def trunc(key_id: str, lead: int = 12, tail: int = 8) -> str:
-    return f"{key_id[:lead]}...{key_id[-tail:]}"
+def utxos_for_wallet(wallet: NullaWallet, el: ElectrumClient) -> list:
+    result = []
+    for addr in wallet.all_addresses():
+        try:
+            for u in el.get_utxos(addr.electrum_scripthash):
+                result.append(UTXO(u["tx_hash"], u["tx_pos"], u["value"], addr, u.get("height",0)))
+        except ElectrumError: pass
+    return result
 
+# ── Commands ──────────────────────────────────────────────────────────────────
 
-# ── Commands ───────────────────────────────────────────────────────────────────
-
-def cmd_create(args, node: LACNodeClient):
+def cmd_create(args):
     path = Path(args.keystore)
     if path.exists():
-        ans = input(f"{YL}  ⚠ Keystore exists at {path}. Overwrite? [yes/no]: {R}")
-        if ans.strip().lower() != "yes":
-            info("Aborted")
-            return
-
+        ans = input(f"{YL}  ⚠ Overwrite existing keystore? [yes/no]: {R}")
+        if ans.strip().lower() != "yes": return info("Aborted")
     path.parent.mkdir(parents=True, exist_ok=True)
-    password = prompt_password(confirm=True)
+    pw = prompt_pw(confirm=True)
+    network = "testnet" if args.testnet else "mainnet"
     info("Generating wallet...")
-    wallet = NullaWallet.generate(password)
-    wallet.save(str(path), password)
-
-    print()
-    hr(56)
-    print(f"  {B}NEW WALLET CREATED{R}")
-    hr(56)
-    print(f"\n  {CY}Key ID (address):{R}")
-    print(f"  {wallet.key_id}")
-    print(f"\n  {B}{YL}RECOVERY PHRASE — WRITE THIS DOWN:{R}")
-    print()
+    wallet = NullaWallet.generate(pw, network=network)
+    wallet.save(str(path), pw)
     words = (wallet.mnemonic or "").split()
+    print()
+    hr(58); print(f"  {B}NEW BITCOIN WALLET{R}"); hr(58)
+    print(f"\n  {CY}Primary address (SegWit):{R}")
+    print(f"  {wallet.address}")
+    print(f"\n  {B}{YL}RECOVERY PHRASE — WRITE DOWN & STORE OFFLINE:{R}\n")
     for row in range(0, len(words), 6):
         chunk = words[row:row+6]
-        cols = "  ".join(f"{i+row+1:2}. {w:<12}" for i, w in enumerate(chunk))
+        cols = "  ".join(f"{i+row+1:2}. {w:<12}" for i,w in enumerate(chunk))
         print(f"  {B}{cols}{R}")
-    print(f"\n  {RD}Never share this phrase. Store it offline.{R}")
-    print(f"\n  Keystore: {path}")
-    hr(56)
-    print()
+    print(f"\n  {RD}Never share this phrase. No recovery without it.{R}")
+    print(f"\n  Keystore: {path}\n  Network:  {network}")
+    hr(58); print()
 
-
-def cmd_import(args, node: LACNodeClient):
+def cmd_import(args):
     path = Path(args.keystore)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    if args.words:
-        mnemonic = " ".join(args.words)
-    else:
-        mnemonic = input("  Mnemonic phrase: ").strip()
-
-    if not mnemonic:
-        die("Mnemonic required")
-
-    password = prompt_password(confirm=True)
+    mnemonic = " ".join(args.words) if args.words else input("  Mnemonic: ").strip()
+    if not mnemonic: die("Mnemonic required")
+    pw = prompt_pw(confirm=True)
+    network = "testnet" if args.testnet else "mainnet"
     try:
-        wallet = NullaWallet.from_mnemonic(mnemonic, password)
-        wallet.save(str(path), password)
-        ok(f"Wallet restored")
-        info(f"Key ID: {wallet.key_id}")
-        info(f"Keystore: {path}")
-    except WalletError as e:
-        die(str(e))
+        wallet = NullaWallet.from_mnemonic(mnemonic, pw, network=network)
+        wallet.save(str(path), pw)
+        ok(f"Wallet restored → {wallet.address}")
+    except WalletError as e: die(str(e))
 
-
-def cmd_balance(args, node: LACNodeClient):
+def cmd_balance(args):
     wallet = load_wallet(Path(args.keystore))
-    info(f"Fetching balance from {node.node_url} ...")
+    el = get_electrum(args)
+    info("Connecting to ElectrumX...")
     try:
-        result = node.get_balance(wallet.key_id)
-        username = node.get_username(wallet.key_id)
-    except NodeConnectionError as e:
-        die(str(e))
+        el.connect()
+        confirmed = unconfirmed = 0
+        for addr in wallet.all_addresses():
+            b = el.get_balance(addr.electrum_scripthash)
+            confirmed   += b["confirmed"]
+            unconfirmed += b["unconfirmed"]
+        print(); hr(50)
+        print(f"  {B}BALANCE  [{wallet.network.upper()}]{R}")
+        hr(50)
+        print(f"  Address:     {DIM}{trunc(wallet.address)}{R}")
+        print(f"  {B}{GR}{format_btc(confirmed + unconfirmed)}{R}")
+        if unconfirmed:
+            print(f"  Unconfirmed: {format_btc(unconfirmed)} (pending)")
+        hr(50); print()
+    except ElectrumError as e: die(str(e))
 
-    print()
-    hr(50)
-    print(f"  {B}BALANCE{R}")
-    hr(50)
-    if username:
-        print(f"  Username:  {CY}@{username}{R}")
-    print(f"  Address:   {DIM}{trunc(wallet.key_id)}{R}")
-    print(f"  {B}{GR}{format_lac(result['balance'])}{R}")
-    if result.get("stash"):
-        print(f"  Stash:     {format_lac(result['stash'])}")
-    if result.get("level"):
-        print(f"  Level:     {result['level']}")
-    hr(50)
-    print()
+def cmd_send(args):
+    wallet  = load_wallet(Path(args.keystore))
+    to      = args.to.strip()
+    amount_btc = float(args.amount)
+    fee_rate   = int(args.fee_rate)
+    amount_sats= int(amount_btc * 1e8)
 
-
-def cmd_send(args, node: LACNodeClient):
-    wallet = load_wallet(Path(args.keystore))
-    kp = wallet.default_keypair()
-
-    to = args.to
-    amount = float(args.amount)
-    fee = float(args.fee)
-    memo = args.memo or ""
-
-    if amount <= 0:
+    if not validate_address(to, wallet.network):
+        die(f"Invalid Bitcoin address: {to}")
+    if amount_sats <= 0:
         die("Amount must be positive")
 
-    # Resolve username → key_id
-    if not validate_key_id(to):
-        info(f"Resolving {to!r}...")
-        resolved = node.resolve_username(to)
-        if not resolved:
-            die(f"Unknown address or username: {to}")
-        to_key_id = resolved
-        info(f"Resolved to: {trunc(to_key_id)}")
-    else:
-        to_key_id = to
-
-    print()
-    hr(50)
-    print(f"  {B}{YL}CONFIRM TRANSACTION{R}")
-    hr(50)
-    print(f"  From:   {trunc(wallet.key_id)}")
-    print(f"  To:     {trunc(to_key_id)}")
-    print(f"  Amount: {B}{format_lac(amount)}{R}")
-    print(f"  Fee:    {format_lac(fee)}")
-    print(f"  Total:  {B}{format_lac(amount + fee)}{R}")
-    if memo:
-        print(f"  Memo:   {memo}")
-    hr(50)
-
-    ans = input("  Type YES to confirm: ").strip()
-    if ans != "YES":
-        info("Cancelled")
-        return
-
-    tx_data = {
-        "from": kp.key_id,
-        "to": to_key_id,
-        "amount": amount,
-        "fee": fee,
-        "timestamp": int(time.time()),
-    }
-    if memo:
-        tx_data["memo"] = memo
-
-    signature = wallet.sign_transaction(tx_data)
-
-    info("Broadcasting...")
+    el = get_electrum(args)
+    info("Fetching UTXOs...")
     try:
-        result = node.send_transaction(
-            from_key_id=kp.key_id,
-            to_key_id=to_key_id,
-            amount=amount,
-            signature=signature,
-            fee=fee,
-            memo=memo,
+        el.connect()
+        utxos       = utxos_for_wallet(wallet, el)
+        total_sats  = sum(u.value for u in utxos)
+        change_addr = wallet.change_address("p2wpkh")
+
+        if not utxos: die("No spendable UTXOs")
+        if total_sats < amount_sats: die(f"Insufficient balance: {format_btc(total_sats)}")
+
+        from nulla_tx import select_utxos
+        selected, fee = select_utxos(utxos, amount_sats, fee_rate)
+        change = sum(u.value for u in selected) - amount_sats - fee
+
+        print(); hr(54); print(f"  {B}{YL}CONFIRM TRANSACTION{R}"); hr(54)
+        print(f"  To:       {to}")
+        print(f"  Amount:   {B}{format_btc(amount_sats)}{R}")
+        print(f"  Fee:      {format_btc(fee)}  ({fee_rate} sat/vB)")
+        print(f"  Total:    {B}{format_btc(amount_sats + fee)}{R}")
+        if change > DUST_LIMIT_P2WPKH:
+            print(f"  Change:   {format_btc(change)}")
+        print(f"  Inputs:   {len(selected)} UTXO(s)")
+        hr(54)
+        ans = input("  Type YES to broadcast: ").strip()
+        if ans != "YES": return info("Cancelled")
+
+        raw_hex, fee_sats, change_sats = build_send_tx(
+            utxos, to, amount_sats, change_addr, fee_rate
         )
-        tx_id = result.get("tx_id", result.get("id", str(result)))
-        ok(f"Sent! TX: {tx_id}")
-    except NodeError as e:
-        die(f"Transaction failed: {e}")
+        info("Broadcasting...")
+        txid = el.broadcast(raw_hex)
+        ok(f"Sent!\n  TXID: {txid}")
+        print(f"  View: https://mempool.space/tx/{txid}")
+    except Exception as e: die(str(e))
 
-
-def cmd_receive(args, node: LACNodeClient):
+def cmd_receive(args):
     wallet = load_wallet(Path(args.keystore))
-    username = node.get_username(wallet.key_id)
+    print(); hr(72); print(f"  {B}RECEIVE BITCOIN{R}"); hr(72)
+    print(f"  Native SegWit (bc1…):")
+    print(f"  {CY}{wallet.address}{R}")
+    legacy = wallet.default_address("p2pkh").address
+    print(f"\n  Legacy (1…) — for older wallets:")
+    print(f"  {DIM}{legacy}{R}")
+    hr(72); print()
 
-    print()
-    hr(70)
-    print(f"  {B}RECEIVE LAC{R}")
-    hr(70)
-    if username:
-        print(f"  Username:  {CY}@{username}{R}  (shareable)")
-    print(f"  Key ID:    {wallet.key_id}")
-    hr(70)
-    print()
-
-
-def cmd_history(args, node: LACNodeClient):
+def cmd_utxos(args):
     wallet = load_wallet(Path(args.keystore))
-    info("Fetching history...")
-    txs = node.get_transactions(wallet.key_id, limit=args.limit)
-
-    if not txs:
-        info("No transactions found")
-        return
-
-    my_key = wallet.key_id
-
-    print()
-    hr(72)
-    print(f"  {B}HISTORY{R}  (latest {len(txs)})")
-    hr(72)
-    print(f"  {'DIR':4}  {'AMOUNT':20}  {'FROM/TO':26}  {'TIME'}")
-    hr(72)
-
-    for tx in txs:
-        tx_to = tx.get("to", tx.get("recipient", ""))
-        tx_from = tx.get("from", tx.get("sender", ""))
-        amount = float(tx.get("amount", 0))
-        ts = tx.get("timestamp", 0)
-        memo = tx.get("memo", "")
-
-        is_in = my_key[:16] in (tx_to or "")
-        direction = f"{GR}↓ IN {R}" if is_in else f"{RD}↑ OUT{R}"
-        amt_str = (f"{GR}+{format_lac(amount)}{R}" if is_in
-                   else f"{RD}-{format_lac(amount)}{R}")
-
-        counterpart = tx_from if is_in else tx_to
-        cp_short = trunc(counterpart, 12, 6) if counterpart else "—"
-
-        from datetime import datetime as dt
-        date_str = dt.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "—"
-
-        line = f"  {direction}  {amt_str:30}  {cp_short:26}  {DIM}{date_str}{R}"
-        print(line)
-        if memo:
-            print(f"         {DIM}memo: {memo}{R}")
-
-    hr(72)
-    print()
-
-
-def cmd_node(args, node: LACNodeClient):
-    info(f"Connecting to {node.node_url}...")
-    result = node.test_connection()
-    if not result["is_connected"]:
-        die(f"Cannot connect: {result.get('error', '?')}")
-
-    print()
-    hr(50)
-    print(f"  {B}NODE STATUS{R}")
-    hr(50)
-    print(f"  URL:          {node.node_url}")
-    print(f"  Block height: {result['block_height']}")
-    print(f"  Latency:      {result['latency_ms']} ms")
-    raw = result.get("raw", {})
-    for k in ("version", "peers", "mining", "uptime"):
-        if k in raw:
-            print(f"  {k.capitalize():13s} {raw[k]}")
-    hr(50)
-    print()
-
-
-def cmd_faucet(args, node: LACNodeClient):
-    wallet = load_wallet(Path(args.keystore))
-    info(f"Requesting faucet for {trunc(wallet.key_id)}...")
+    el = get_electrum(args)
+    info("Fetching UTXOs...")
     try:
-        result = node.faucet(wallet.key_id)
-        ok(f"Response: {result}")
-    except NodeError as e:
-        die(str(e))
+        el.connect()
+        utxos = utxos_for_wallet(wallet, el)
+        if not utxos: return info("No UTXOs found")
+        total = sum(u.value for u in utxos)
+        print(); hr(72)
+        print(f"  {B}UTXOs  ({len(utxos)} total — {format_btc(total)}){R}")
+        hr(72)
+        print(f"  {'TXID':14} {'VOUT':5} {'VALUE':18} {'TYPE':8} STATUS")
+        hr(72)
+        for u in sorted(utxos, key=lambda x: -x.value):
+            status = f"block {u.height}" if u.height > 0 else f"{YL}unconfirmed{R}"
+            print(f"  {u.txid[:12]}… {u.vout:<5} {format_btc(u.value):18} {u.address.addr_type:8} {status}")
+        hr(72)
+        print(f"  {B}Total: {format_btc(total)}{R}")
+        print()
+    except ElectrumError as e: die(str(e))
 
-
-def cmd_accounts(args, node: LACNodeClient):
+def cmd_history(args):
     wallet = load_wallet(Path(args.keystore))
-    print()
-    hr(78)
-    print(f"  {B}ACCOUNTS{R}")
-    hr(78)
-    for acc in wallet.all_accounts():
-        marker = f"{GR}●{R}" if acc["index"] == 0 else f"{DIM}○{R}"
-        print(f"  {marker} [{acc['index']}] {acc['key_id']}")
-        print(f"        {DIM}{acc['path']}{R}")
-    hr(78)
-    print()
+    el = get_electrum(args)
+    info("Fetching history...")
+    try:
+        el.connect()
+        scripthashes = [a.electrum_scripthash for a in wallet.all_addresses()]
+        history = el.get_history_multi(scripthashes)[:args.limit]
+        if not history: return info("No transactions found")
+        print(); hr(72); print(f"  {B}HISTORY{R}"); hr(72)
+        for tx in history:
+            h    = tx["height"]
+            conf = f"block {h}" if h > 0 else f"{YL}unconfirmed{R}"
+            print(f"  {tx['tx_hash'][:20]}…  {DIM}{conf}{R}")
+            print(f"    mempool.space/tx/{tx['tx_hash']}")
+        hr(72); print()
+    except ElectrumError as e: die(str(e))
 
+def cmd_node(args):
+    el = get_electrum(args)
+    info("Testing ElectrumX connection...")
+    result = el.test_connection()
+    print(); hr(50); print(f"  {B}NODE STATUS{R}"); hr(50)
+    if not result["connected"]:
+        print(f"  {RD}✗ {result.get('error','Failed')}{R}")
+    else:
+        print(f"  {GR}✓ Connected{R}")
+        print(f"  Server:   {result['server']}:{result['port']}")
+        print(f"  Protocol: {result['protocol']}")
+        print(f"  Height:   {result['height']:,}")
+        print(f"  Latency:  {result['latency_ms']} ms")
+    hr(50); print()
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+def cmd_fee(args):
+    el = get_electrum(args)
+    try:
+        el.connect()
+        print(); hr(46); print(f"  {B}FEE ESTIMATES{R}"); hr(46)
+        for blocks, label in [(1,"~10 min"), (3,"~30 min"), (6,"~1 hour")]:
+            rate = el.estimate_fee(blocks)
+            print(f"  {blocks} block(s) [{label}]:  {B}{rate} sat/vbyte{R}")
+        hr(46); print()
+    except ElectrumError as e: die(str(e))
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="nulla",
-        description="Nulla — LAC Light Wallet",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.strip(),
-    )
-    p.add_argument("--node",      default=DEFAULT_NODE,       help="LAC node URL")
-    p.add_argument("--keystore",  default=str(DEFAULT_KEYSTORE), help="Keystore path")
+def cmd_accounts(args):
+    wallet = load_wallet(Path(args.keystore))
+    print(); hr(76); print(f"  {B}ADDRESSES{R}"); hr(76)
+    for group in wallet.all_accounts_summary():
+        t = group["type"]
+        label = "Native SegWit (BIP84)" if t=="p2wpkh" else "Legacy (BIP44)"
+        print(f"\n  {CY}{label}{R}")
+        for a in group["addresses"][:5]:
+            marker = f"{GR}●{R}" if a["path"].endswith("/0/0") else f"{DIM}○{R}"
+            print(f"  {marker} {a['address']}  {DIM}{a['path']}{R}")
+    hr(76); print()
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print(BANNER)
+    p = argparse.ArgumentParser(prog="nulla", description="Nulla Bitcoin Wallet")
+    p.add_argument("--keystore", default=str(DEFAULT_KEYSTORE))
+    p.add_argument("--testnet",  action="store_true")
 
     sub = p.add_subparsers(dest="cmd", metavar="command")
 
     sub.add_parser("create",   help="Create new wallet")
-
-    pi = sub.add_parser("import", help="Import from mnemonic")
-    pi.add_argument("words", nargs="*", help="Mnemonic words (interactive if omitted)")
-
+    pi = sub.add_parser("import",  help="Import from mnemonic")
+    pi.add_argument("words", nargs="*")
     sub.add_parser("balance",  help="Show balance")
     sub.add_parser("receive",  help="Show receive address")
-    sub.add_parser("accounts", help="List derived accounts")
-    sub.add_parser("node",     help="Node status")
-    sub.add_parser("faucet",   help="Request testnet tokens (testnet only)")
+    sub.add_parser("utxos",    help="List UTXOs")
+    sub.add_parser("node",     help="ElectrumX status")
+    sub.add_parser("fee",      help="Fee estimates")
+    sub.add_parser("accounts", help="All derived addresses")
 
-    ps = sub.add_parser("send",    help="Send LAC")
-    ps.add_argument("to",     help="Recipient key_id or @username")
-    ps.add_argument("amount", help="Amount in LAC")
-    ps.add_argument("--fee",  default="0.001", help="Fee [0.001]")
-    ps.add_argument("--memo", default="",      help="Optional memo")
+    ps = sub.add_parser("send", help="Send BTC")
+    ps.add_argument("to")
+    ps.add_argument("amount", help="Amount in BTC")
+    ps.add_argument("--fee-rate", default="5", help="sat/vbyte [5]")
 
     ph = sub.add_parser("history", help="Transaction history")
-    ph.add_argument("--limit", type=int, default=20, help="Max rows [20]")
+    ph.add_argument("--limit", type=int, default=20)
 
-    return p
-
-
-def main():
-    print(BANNER)
-    parser = build_parser()
-    args = parser.parse_args()
-
+    args = p.parse_args()
     if not args.cmd:
-        parser.print_help()
-        return
-
-    node = LACNodeClient(args.node)
+        p.print_help(); return
 
     handlers = {
-        "create":   cmd_create,
-        "import":   cmd_import,
-        "balance":  cmd_balance,
-        "send":     cmd_send,
-        "receive":  cmd_receive,
-        "history":  cmd_history,
-        "node":     cmd_node,
-        "faucet":   cmd_faucet,
-        "accounts": cmd_accounts,
+        "create": cmd_create, "import": cmd_import,
+        "balance": cmd_balance, "send": cmd_send,
+        "receive": cmd_receive, "utxos": cmd_utxos,
+        "history": cmd_history, "node": cmd_node,
+        "fee": cmd_fee, "accounts": cmd_accounts,
     }
 
-    fn = handlers.get(args.cmd)
-    if not fn:
-        parser.print_help()
-        return
-
     try:
-        fn(args, node)
+        handlers[args.cmd](args)
     except KeyboardInterrupt:
         print(f"\n{DIM}Interrupted{R}")
     except NullaError as e:
         die(str(e))
-
 
 if __name__ == "__main__":
     main()

@@ -1,172 +1,111 @@
-# Nulla — LAC Light Wallet
+# Nulla — Bitcoin Light Wallet
 
-Privacy-first light client for the [LightAnonChain (LAC)](https://lac-beta.uk) blockchain.
-Standalone app — integrates directly into `lac_node.py` when ready.
+Мінімалістичний Bitcoin light client у стилі Electrum.
+Standalone додаток — пізніше інтегрується в LAC для свапів BTC↔LAC.
+
+## Архітектура
+
+```
+nulla_core.py       BIP39/32/44/84 HD wallet, bech32, keystore AES-GCM
+nulla_electrum.py   ElectrumX protocol client (SSL TCP, JSON-RPC)
+nulla_tx.py         Bitcoin transaction builder (P2WPKH + P2PKH, BIP143)
+nulla_cli.py        CLI interface
+nulla_server.py     Flask JSON API + React SPA
+ui/                 React frontend (Bitcoin orange, dark)
+```
 
 ## Features
 
-- **BIP39 HD wallet** — 24-word mnemonic, SLIP-0010 Ed25519 derivation
-- **AES-256-GCM keystore** — PBKDF2 × 600k iterations, HMAC-verified
-- **E2E encryption** — X25519 ECDH + HKDF + AES-GCM
-- **Full node client** — balance, send, history, username registry
-- **Web UI** — dark terminal aesthetic, mobile-first PWA-ready
-- **CLI** — `nulla balance`, `nulla send`, `nulla history`, ...
-- **Zero telemetry** — keys never leave your device
+- **BIP39** — 24-word mnemonic (256-bit entropy)
+- **BIP84** — Native SegWit (bc1…) addresses
+- **BIP44** — Legacy (1…) addresses
+- **ElectrumX** — підключення до Bitcoin мережі без повного вузла
+- **UTXO** — coin selection, fee estimation, change management
+- **BIP143** — правильний sighash для SegWit транзакцій
+- **Keystore** — AES-256-GCM + PBKDF2 × 600k + HMAC-SHA256
+- **CLI + Web UI** — обидва інтерфейси
 
----
-
-## Quick Start
-
-### 1. Python setup
+## Швидкий старт
 
 ```bash
 git clone https://github.com/epidemiaya/nulla
 cd nulla
 
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+
 pip install -r requirements.txt
-```
 
-### 2. Build the UI
+# Збірка UI
+cd ui && npm install && npm run build && cd ..
 
-```bash
-cd ui
-npm install
-npm run build
-cd ..
-```
-
-### 3. Run
-
-```bash
-# Web UI + API server (opens browser automatically)
+# Запуск (відкриє браузер)
 python nulla_server.py
-
-# Or with custom node
-python nulla_server.py --node https://your-lac-node.example.com --port 7421
 ```
 
-Open: **http://localhost:7421**
+Відкрий: **http://localhost:7421**
 
 ---
 
-## CLI Usage
+## CLI
 
 ```bash
-# Alias (optional)
-alias nulla="python nulla_cli.py"
+python nulla_cli.py create           # Новий гаманець
+python nulla_cli.py import word1 ... # Відновлення з мнемоніки
+python nulla_cli.py balance          # Баланс
+python nulla_cli.py receive          # Адреса для отримання
+python nulla_cli.py send bc1q... 0.001  # Відправка
+python nulla_cli.py utxos            # Список UTXO
+python nulla_cli.py history          # Історія транзакцій
+python nulla_cli.py fee              # Поточні fee rates
+python nulla_cli.py node             # Статус ElectrumX сервера
+python nulla_cli.py accounts         # Всі адреси
 
-nulla create                        # Create new wallet
-nulla import word1 word2 ... word24 # Restore from mnemonic
-nulla balance                       # Show balance
-nulla receive                       # Show your address
-nulla send <key_id> 10.0            # Send 10 LAC
-nulla send @alice 5.0 --memo "ty"   # Send to username
-nulla history --limit 50            # Transaction history
-nulla node                          # Node status
-nulla faucet                        # Get testnet tokens
-nulla accounts                      # List HD accounts
-
-# Options
-nulla --node https://my-node.com balance
-nulla --keystore /path/to/wallet.nulla balance
+# Testnet
+python nulla_cli.py --testnet balance
 ```
 
 ---
 
-## LAC Integration
+## ElectrumX сервери (mainnet)
 
-`nulla_core.py` is a self-contained library with no LAC-specific imports.
-To integrate into `lac_node.py`:
-
-```python
-from nulla_core import NullaWallet, NullaKeyPair
-
-# Load wallet
-wallet = NullaWallet.load("~/.nulla/wallet.nulla", password)
-
-# Sign a transaction
-signature = wallet.sign_transaction(tx_dict)
-
-# E2E encrypt a message
-encrypted = wallet.default_keypair().encrypt_to(recipient_x25519_pub, message)
-```
+Nulla автоматично вибирає доступний сервер зі списку:
+- `electrum.blockstream.info:700`
+- `electrum.bitaroo.net:50002`
+- `fortress.qtornado.com:443`
+- `electrum.jochen-hoenicke.de:50006`
+- і ще кілька
 
 ---
 
-## Keystore Format
+## Безпека
 
-```json
-{
-  "version": 1,
-  "nulla_version": "1.0.0",
-  "metadata": { "created": "...", "accounts_derived": 5 },
-  "accounts": [{ "index": 0, "path": "m/44'/999'/0'/0'/0'", "key_id": "..." }],
-  "crypto": {
-    "cipher": "aes-256-gcm",
-    "ciphertext": "...",
-    "nonce": "...",
-    "mac": "...",
-    "kdf": "pbkdf2",
-    "kdfparams": {
-      "iterations": 600000,
-      "hash": "sha256",
-      "salt": "...",
-      "dklen": 32
-    }
-  }
-}
-```
+| Компонент | Деталь |
+|-----------|--------|
+| secp256k1 | `coincurve` (libsecp256k1, те саме що Bitcoin Core) |
+| Підпис | ECDSA deterministic (RFC6979), low-S (BIP62) |
+| Keystore | AES-256-GCM, PBKDF2-SHA256 × 600,000 ітерацій |
+| MAC | HMAC-SHA256 перед дешифруванням (constant-time compare) |
+| Сервер | Bind тільки на 127.0.0.1 |
+| Пам'ять | `wallet.lock()` очищає ключі |
 
 ---
 
-## Security Notes
+## Roadmap
 
-- Private keys are derived using SLIP-0010 with **hardened** paths only
-  (Ed25519 does not support non-hardened child keys)
-- Keystore uses PBKDF2-SHA256 × 600,000 iterations (OWASP 2023 recommendation)
-- MAC verification uses `hmac.compare_digest` (constant-time)
-- GCM authentication tag validates integrity before decryption
-- The server **only binds to 127.0.0.1** — not accessible from network
-- `wallet.lock()` overwrites key material before clearing references
-
----
-
-## Dev Mode (UI hot reload)
-
-```bash
-# Terminal 1 — Flask API
-python nulla_server.py --no-browser
-
-# Terminal 2 — Vite dev server
-cd ui && npm run dev
-# Open http://localhost:5173
-```
+- [x] BIP39/84/44 HD wallet
+- [x] ElectrumX client
+- [x] P2WPKH транзакції
+- [x] CLI + Web UI
+- [ ] BIP44/49 (P2SH-SegWit) підтримка
+- [ ] Hardware wallet (Trezor/Ledger)
+- [ ] LAC↔BTC atomic swap модуль
 
 ---
 
-## File Structure
+## Ліцензія
 
-```
-nulla/
-├── nulla_core.py      HD wallet + keystore crypto
-├── nulla_node.py      LAC node REST client
-├── nulla_cli.py       CLI interface
-├── nulla_server.py    Flask server + JSON API
-├── requirements.txt
-├── README.md
-└── ui/
-    ├── src/
-    │   ├── main.jsx
-    │   └── App.jsx    Full React SPA
-    ├── index.html
-    ├── package.json
-    └── vite.config.js
-```
-
----
-
-## License
-
-MIT — part of the LightAnonChain ecosystem.
+MIT — частина екосистеми LightAnonChain.
