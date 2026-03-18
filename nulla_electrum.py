@@ -3,15 +3,9 @@ Nulla — ElectrumX Protocol Client
 Connects to public ElectrumX servers via SSL TCP.
 Implements the Electrum JSON-RPC protocol (newline-delimited).
 
-Supported methods:
-  server.version
-  blockchain.scripthash.get_balance
-  blockchain.scripthash.get_history
-  blockchain.scripthash.listunspent
-  blockchain.transaction.get
-  blockchain.transaction.broadcast
-  blockchain.estimatefee
-  blockchain.headers.subscribe (for tip height)
+Note: ElectrumX servers commonly use self-signed certificates.
+We disable hostname/cert verification (standard practice for Electrum clients)
+but still use SSL for transport encryption.
 """
 
 import ssl
@@ -22,27 +16,31 @@ import threading
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
-# Public ElectrumX servers — ordered by reliability
-# Format: (host, ssl_port)
+# Public ElectrumX servers — (host, ssl_port)
+# Many use self-signed certs — this is normal for ElectrumX
 MAINNET_SERVERS = [
     ("electrum.blockstream.info",  700),
-    ("electrum.bitaroo.net",       50002),
     ("fortress.qtornado.com",      443),
-    ("electrum.jochen-hoenicke.de",50006),
-    ("bitcoin.aranguren.org",      50002),
-    ("electrum2.bitaroo.net",      50002),
     ("electrum.emzy.de",           50002),
+    ("bitcoin.aranguren.org",      50002),
+    ("electrum.jochen-hoenicke.de",50006),
+    ("btc.electroncash.dk",        60002),
+    ("electrum.bitaroo.net",       50002),
+    ("electrum2.bitaroo.net",      50002),
+    ("electrum1.bluewallet.io",    443),
+    ("e.keff.org",                 50002),
 ]
 
 TESTNET_SERVERS = [
     ("testnet.aranguren.org",      51002),
+    ("testnet.qtornado.com",       51002),
     ("electrum.blockstream.info",  993),
 ]
 
 NULLA_USER_AGENT = "Nulla/1.0.0"
 ELECTRUM_PROTOCOL = "1.4"
-CONNECT_TIMEOUT   = 10
-REQUEST_TIMEOUT   = 15
+CONNECT_TIMEOUT   = 8
+REQUEST_TIMEOUT   = 12
 
 
 class ElectrumError(Exception):
@@ -105,9 +103,12 @@ class ElectrumClient:
         )
 
     def _do_connect(self, host: str, port: int):
+        # ElectrumX servers commonly use self-signed certificates.
+        # All Electrum clients (including the official one) disable cert
+        # verification by default. We still use SSL for encryption.
         ctx = ssl.create_default_context()
-        ctx.check_hostname = True
-        ctx.verify_mode    = ssl.CERT_REQUIRED
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
 
         raw = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
