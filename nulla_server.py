@@ -307,45 +307,61 @@ def api_utxos():
 @app.route("/api/transactions")
 @require_unlocked
 def api_transactions():
-    limit  = int(request.args.get("limit", 25))
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    limit = int(request.args.get("limit", 25))
     try:
-        el          = _get_electrum()
-        my_addrs    = {a.address for a in _wallet.all_addresses()}
-        scripthashes= [a.electrum_scripthash for a in _wallet.all_addresses()]
-        history     = el.get_history_multi(scripthashes)[:limit]
+        addrs        = _wallet.all_addresses()
+        my_addrs     = {a.address for a in addrs}
+        scripthashes = [a.electrum_scripthash for a in addrs]
 
-        result = []
-        for item in history:
+        # Step 1: get history (parallel, fast)
+        history = _query_parallel(scripthashes, "blockchain.scripthash.get_history")
+        all_txs = []
+        seen = set()
+        for sh, items in history.items():
+            if not items:
+                continue
+            for item in items:
+                if item["tx_hash"] not in seen:
+                    seen.add(item["tx_hash"])
+                    all_txs.append(item)
+        # Sort: unconfirmed first, then by height desc
+        all_txs.sort(key=lambda x: -(x.get("height") or 9_999_999))
+        all_txs = all_txs[:limit]
+
+        # Step 2: fetch tx details in parallel for amount info
+        def fetch_tx(item):
             txid = item["tx_hash"]
-            # Try to get tx details for amount
             try:
+                el  = _get_electrum()
                 raw = el.get_transaction(txid, verbose=True)
-                # Parse outputs
-                total_out_to_us = 0
-                total_in_from_us = 0
+                total = 0
                 if isinstance(raw, dict):
                     for vout in raw.get("vout", []):
                         spk  = vout.get("scriptPubKey", {})
                         addr = spk.get("address") or (spk.get("addresses") or [None])[0]
                         if addr and addr in my_addrs:
-                            val = int(vout.get("value", 0) * 1e8)
-                            total_out_to_us += val
-                direction = "in" if total_out_to_us > 0 else "out"
-                result.append({
+                            total += int(vout.get("value", 0) * 1e8)
+                return {
                     "txid":      txid,
                     "height":    item.get("height", 0),
-                    "confirmed": item.get("height", 0) > 0,
-                    "amount":    total_out_to_us,
-                    "direction": direction,
-                })
+                    "confirmed": (item.get("height") or 0) > 0,
+                    "amount":    total,
+                    "direction": "in" if total > 0 else "out",
+                }
             except Exception:
-                result.append({
+                return {
                     "txid":      txid,
                     "height":    item.get("height", 0),
-                    "confirmed": item.get("height", 0) > 0,
+                    "confirmed": (item.get("height") or 0) > 0,
                     "amount":    0,
                     "direction": "unknown",
-                })
+                }
+
+        result = []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for tx in pool.map(fetch_tx, all_txs):
+                result.append(tx)
 
         return ok(transactions=result)
     except ElectrumError as e:
@@ -459,9 +475,19 @@ def api_send_preview():
 @app.route("/api/node/status")
 def api_node_status():
     try:
-        el     = _get_electrum()
-        result = el.test_connection()
-        return ok(**result)
+        el = _get_electrum()
+        si = el.server_info or {}
+        # Use cached info — no reconnect, instant response
+        if el.is_connected and si:
+            return ok(
+                connected  = True,
+                server     = si.get("host"),
+                port       = si.get("port"),
+                protocol   = si.get("protocol"),
+                height     = _get_electrum().get_block_height(),
+                latency_ms = 0,
+            )
+        return ok(connected=False, error="Not connected")
     except Exception as e:
         return ok(connected=False, error=str(e))
 
