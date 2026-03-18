@@ -70,32 +70,96 @@ def require_unlocked(f):
         return f(*args, **kwargs)
     return wrapper
 
+# ── Connection pool ───────────────────────────────────────────────────────────
+# ElectrumX is sequential JSON-RPC over one TCP socket.
+# For parallel queries we need N independent connections.
+
+import threading as _threading
+_pool_lock  = _threading.Lock()
+_conn_pool  = []   # list of connected ElectrumClient instances
+POOL_SIZE   = 4    # 4 parallel connections is enough
+
 def _get_electrum() -> ElectrumClient:
+    """Get or create a single shared client (for single queries)."""
     global _electrum
     if _electrum is None:
         _electrum = ElectrumClient(network=_network)
-    # Connect once and reuse — don't reconnect on every request
     if not _electrum.is_connected:
         _electrum.connect()
     return _electrum
 
-def _all_utxos_for_wallet() -> list:
-    """Fetch and assemble UTXOs for all wallet addresses."""
-    el   = _get_electrum()
-    utxo_list = []
-    for addr in _wallet.all_addresses():
+def _get_pool() -> list:
+    """Get or create a pool of N connected ElectrumClient instances."""
+    global _conn_pool
+    with _pool_lock:
+        # Remove dead connections
+        _conn_pool = [c for c in _conn_pool if c.is_connected]
+        # Fill pool up to POOL_SIZE
+        while len(_conn_pool) < POOL_SIZE:
+            try:
+                c = ElectrumClient(network=_network)
+                c.connect()
+                _conn_pool.append(c)
+            except Exception:
+                break
+        return list(_conn_pool)
+
+def _query_parallel(scripthashes: list, method: str) -> dict:
+    """
+    Query multiple scripthashes in parallel using connection pool.
+    Returns {scripthash: result}.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    pool    = _get_pool()
+    n       = len(pool)
+    results = {}
+
+    if not pool:
+        # Fallback: single connection sequential
+        el = _get_electrum()
+        for sh in scripthashes:
+            try:
+                results[sh] = el.call(method, [sh])
+            except Exception:
+                results[sh] = None
+        return results
+
+    def fetch(sh, conn):
         try:
-            raw_utxos = el.get_utxos(addr.electrum_scripthash)
-            for u in raw_utxos:
-                utxo_list.append(UTXO(
-                    txid    = u["tx_hash"],
-                    vout    = u["tx_pos"],
-                    value   = u["value"],
-                    address = addr,
-                    height  = u.get("height", 0),
-                ))
-        except ElectrumError:
-            pass
+            return sh, conn.call(method, [sh])
+        except Exception:
+            return sh, None
+
+    with ThreadPoolExecutor(max_workers=n) as executor:
+        futs = [
+            executor.submit(fetch, sh, pool[i % n])
+            for i, sh in enumerate(scripthashes)
+        ]
+        for f in as_completed(futs):
+            sh, val = f.result()
+            results[sh] = val
+
+    return results
+
+def _all_utxos_for_wallet() -> list:
+    """Fetch UTXOs for all wallet addresses in parallel."""
+    addrs  = _wallet.all_addresses()
+    sh_map = {a.electrum_scripthash: a for a in addrs}
+    raw    = _query_parallel(list(sh_map.keys()), "blockchain.scripthash.listunspent")
+
+    utxo_list = []
+    for sh, utxos in raw.items():
+        if not utxos:
+            continue
+        addr = sh_map[sh]
+        for u in utxos:
+            utxo_list.append(UTXO(
+                txid    = u["tx_hash"],
+                vout    = u["tx_pos"],
+                value   = u["value"],
+                address = addr,
+                height  = u.get("height", 0),
+            ))
     return utxo_list
 
 
@@ -197,23 +261,16 @@ def api_info():
 @app.route("/api/balance")
 @require_unlocked
 def api_balance():
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     try:
-        el = _get_electrum()
-        addrs = _wallet.all_addresses()
-        confirmed = 0
-        unconfirmed = 0
+        addrs  = _wallet.all_addresses()
+        sh_map = {a.electrum_scripthash: a for a in addrs}
+        raw    = _query_parallel(list(sh_map.keys()), "blockchain.scripthash.get_balance")
 
-        def fetch_one(addr):
-            try:
-                return el.get_balance(addr.electrum_scripthash)
-            except Exception:
-                return {"confirmed": 0, "unconfirmed": 0}
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for b in pool.map(fetch_one, addrs):
-                confirmed   += b.get("confirmed", 0)
-                unconfirmed += b.get("unconfirmed", 0)
+        confirmed = unconfirmed = 0
+        for val in raw.values():
+            if val:
+                confirmed   += val.get("confirmed", 0)
+                unconfirmed += val.get("unconfirmed", 0)
 
         return ok(
             confirmed   = confirmed,
@@ -222,7 +279,7 @@ def api_balance():
             formatted   = format_btc(confirmed + unconfirmed),
             address     = _wallet.address,
         )
-    except ElectrumError as e:
+    except Exception as e:
         return err(str(e))
 
 
