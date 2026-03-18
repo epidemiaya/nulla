@@ -197,17 +197,24 @@ def api_info():
 @app.route("/api/balance")
 @require_unlocked
 def api_balance():
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     try:
         el = _get_electrum()
+        addrs = _wallet.all_addresses()
         confirmed = 0
         unconfirmed = 0
-        for addr in _wallet.all_addresses():
+
+        def fetch_one(addr):
             try:
-                b = el.get_balance(addr.electrum_scripthash)
-                confirmed   += b["confirmed"]
-                unconfirmed += b["unconfirmed"]
-            except ElectrumError:
-                pass
+                return el.get_balance(addr.electrum_scripthash)
+            except Exception:
+                return {"confirmed": 0, "unconfirmed": 0}
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for b in pool.map(fetch_one, addrs):
+                confirmed   += b.get("confirmed", 0)
+                unconfirmed += b.get("unconfirmed", 0)
+
         return ok(
             confirmed   = confirmed,
             unconfirmed = unconfirmed,
