@@ -53,6 +53,23 @@ _wallet: NullaWallet = None
 _electrum: ElectrumClient = None
 _network: str = "mainnet"
 
+# Simple TTL cache — avoids hammering ElectrumX on every page load
+import time as _time
+_cache: dict = {}
+_CACHE_TTL = 15  # seconds
+
+def _cache_get(key):
+    entry = _cache.get(key)
+    if entry and (_time.time() - entry["ts"]) < _CACHE_TTL:
+        return entry["val"]
+    return None
+
+def _cache_set(key, val):
+    _cache[key] = {"val": val, "ts": _time.time()}
+
+def _cache_clear():
+    _cache.clear()
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -261,6 +278,10 @@ def api_info():
 @app.route("/api/balance")
 @require_unlocked
 def api_balance():
+    cache_key = f"balance_{_wallet.address}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return jsonify({"ok": True, **cached, "cached": True})
     try:
         addrs  = _wallet.all_addresses()
         sh_map = {a.electrum_scripthash: a for a in addrs}
@@ -272,13 +293,15 @@ def api_balance():
                 confirmed   += val.get("confirmed", 0)
                 unconfirmed += val.get("unconfirmed", 0)
 
-        return ok(
+        result = dict(
             confirmed   = confirmed,
             unconfirmed = unconfirmed,
             total       = confirmed + unconfirmed,
             formatted   = format_btc(confirmed + unconfirmed),
             address     = _wallet.address,
         )
+        _cache_set(cache_key, result)
+        return ok(**result)
     except Exception as e:
         return err(str(e))
 
@@ -309,6 +332,10 @@ def api_utxos():
 def api_transactions():
     from concurrent.futures import ThreadPoolExecutor, as_completed
     limit = int(request.args.get("limit", 25))
+    cache_key = f"txs_{_wallet.address}_{limit}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return jsonify({"ok": True, "transactions": cached, "cached": True})
     try:
         addrs        = _wallet.all_addresses()
         my_addrs     = {a.address for a in addrs}
@@ -363,6 +390,7 @@ def api_transactions():
             for tx in pool.map(fetch_tx, all_txs):
                 result.append(tx)
 
+        _cache_set(cache_key, result)
         return ok(transactions=result)
     except ElectrumError as e:
         return err(str(e))
@@ -424,6 +452,7 @@ def api_send():
         el   = _get_electrum()
         txid = el.broadcast(raw_hex)
 
+        _cache_clear()  # invalidate balance/tx cache after send
         return ok(
             txid       = txid,
             amount     = amount_sats,
