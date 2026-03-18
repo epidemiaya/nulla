@@ -39,8 +39,8 @@ TESTNET_SERVERS = [
 
 NULLA_USER_AGENT = "Nulla/1.0.0"
 ELECTRUM_PROTOCOL = "1.4"
-CONNECT_TIMEOUT   = 8
-REQUEST_TIMEOUT   = 12
+CONNECT_TIMEOUT   = 5   # fail fast → try next server
+REQUEST_TIMEOUT   = 8
 
 
 class ElectrumError(Exception):
@@ -75,9 +75,10 @@ class ElectrumClient:
 
     # ── Connection ────────────────────────────────────────────────────────────
 
-    def connect(self, shuffle: bool = True) -> Dict:
+    def connect(self, shuffle: bool = False) -> Dict:
         """
-        Try each server until one connects.
+        Try each server in priority order until one connects.
+        shuffle=False keeps the fast servers first.
         Returns server info dict.
         Raises ElectrumConnectionError if all fail.
         """

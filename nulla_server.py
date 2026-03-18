@@ -74,6 +74,9 @@ def _get_electrum() -> ElectrumClient:
     global _electrum
     if _electrum is None:
         _electrum = ElectrumClient(network=_network)
+    # Connect once and reuse — don't reconnect on every request
+    if not _electrum.is_connected:
+        _electrum.connect()
     return _electrum
 
 def _all_utxos_for_wallet() -> list:
