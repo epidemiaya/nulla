@@ -56,7 +56,7 @@ _network: str = "mainnet"
 # Simple TTL cache — avoids hammering ElectrumX on every page load
 import time as _time
 _cache: dict = {}
-_CACHE_TTL = 15  # seconds
+_CACHE_TTL = 60  # seconds
 
 def _cache_get(key):
     entry = _cache.get(key)
@@ -408,6 +408,11 @@ def api_transactions():
         # Sort: unconfirmed first, then by height desc
         all_txs.sort(key=lambda x: -(x.get("height") or 9_999_999))
         all_txs = all_txs[:limit]
+
+        # Empty history — return immediately (no network calls needed)
+        if not all_txs:
+            _cache_set(cache_key, [])
+            return ok(transactions=[])
 
         # Step 2: fetch tx details in parallel for amount info
         def fetch_tx(item):
