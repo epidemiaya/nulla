@@ -378,12 +378,26 @@ def api_utxos():
         return err(str(e))
 
 
+# ── Per-TX detail cache (survives across requests, TTL 10 min) ────────────────
+_tx_detail_cache: dict = {}
+_TX_CACHE_TTL = 600  # confirmed txs don't change — cache 10 min
+
+def _tx_cache_get(txid: str):
+    e = _tx_detail_cache.get(txid)
+    if e and (_time.time() - e["ts"]) < _TX_CACHE_TTL:
+        return e["val"]
+    return None
+
+def _tx_cache_set(txid: str, val: dict):
+    _tx_detail_cache[txid] = {"val": val, "ts": _time.time()}
+
+
 # ── API: transactions ─────────────────────────────────────────────────────────
 
 @app.route("/api/transactions")
 @require_unlocked
 def api_transactions():
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
     limit = int(request.args.get("limit", 25))
     cache_key = f"txs_{_wallet.address}_{limit}"
     cached = _cache_get(cache_key)
@@ -394,59 +408,71 @@ def api_transactions():
         my_addrs     = {a.address for a in addrs}
         scripthashes = [a.electrum_scripthash for a in addrs]
 
-        # Step 1: get history (parallel, fast)
+        # Step 1: history in parallel (fast — no verbose)
         history = _query_parallel(scripthashes, "blockchain.scripthash.get_history")
         all_txs = []
         seen = set()
         for sh, items in history.items():
-            if not items:
-                continue
-            for item in items:
+            for item in (items or []):
                 if item["tx_hash"] not in seen:
                     seen.add(item["tx_hash"])
                     all_txs.append(item)
-        # Sort: unconfirmed first, then by height desc
         all_txs.sort(key=lambda x: -(x.get("height") or 9_999_999))
         all_txs = all_txs[:limit]
 
-        # Empty history — return immediately (no network calls needed)
         if not all_txs:
             _cache_set(cache_key, [])
             return ok(transactions=[])
 
-        # Step 2: fetch tx details in parallel for amount info
-        def fetch_tx(item):
-            txid = item["tx_hash"]
+        # Step 2: fetch tx details — use per-tx cache, skip confirmed hits
+        pool_conns = _get_pool()
+        n = max(1, len(pool_conns))
+
+        def fetch_tx(args):
+            item, conn_idx = args
+            txid      = item["tx_hash"]
+            height    = item.get("height", 0)
+            confirmed = (height or 0) > 0
+
+            # Hit per-tx cache for confirmed txs (they never change)
+            if confirmed:
+                cached_tx = _tx_cache_get(txid)
+                if cached_tx:
+                    return cached_tx
+
             try:
-                el  = _get_electrum()
-                raw = el.get_transaction(txid, verbose=True)
+                conn = pool_conns[conn_idx % n]
+                raw  = conn.get_transaction(txid, verbose=True)
                 total = 0
                 if isinstance(raw, dict):
                     for vout in raw.get("vout", []):
                         spk  = vout.get("scriptPubKey", {})
-                        addr = spk.get("address") or (spk.get("addresses") or [None])[0]
+                        addr = (spk.get("address") or
+                                (spk.get("addresses") or [None])[0])
                         if addr and addr in my_addrs:
                             total += int(vout.get("value", 0) * 1e8)
-                return {
+                result = {
                     "txid":      txid,
-                    "height":    item.get("height", 0),
-                    "confirmed": (item.get("height") or 0) > 0,
+                    "height":    height,
+                    "confirmed": confirmed,
                     "amount":    total,
                     "direction": "in" if total > 0 else "out",
                 }
+                if confirmed:
+                    _tx_cache_set(txid, result)
+                return result
             except Exception:
                 return {
                     "txid":      txid,
-                    "height":    item.get("height", 0),
-                    "confirmed": (item.get("height") or 0) > 0,
+                    "height":    height,
+                    "confirmed": confirmed,
                     "amount":    0,
                     "direction": "unknown",
                 }
 
-        result = []
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            for tx in pool.map(fetch_tx, all_txs):
-                result.append(tx)
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            result = list(pool.map(fetch_tx,
+                [(item, i) for i, item in enumerate(all_txs)]))
 
         _cache_set(cache_key, result)
         return ok(transactions=result)
