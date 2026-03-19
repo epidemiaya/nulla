@@ -594,11 +594,16 @@ function ScreenAddresses() {
     "p2pkh":       T.muted,
   };
 
+  const loading_ref = useRef(false);
+
   const load = async () => {
+    if (loading_ref.current) return;
+    loading_ref.current = true;
     setLoading(true);
     const r = await api("/addresses");
     if (r.ok) setGroups(r.groups || []);
     setLoading(false);
+    loading_ref.current = false;
   };
 
   useEffect(() => { load(); }, []);

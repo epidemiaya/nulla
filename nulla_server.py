@@ -279,6 +279,10 @@ def api_info():
 @require_unlocked
 def api_addresses():
     """All addresses with balances, grouped by type."""
+    cache_key = f"addrs_{_wallet.address}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return jsonify({"ok": True, "groups": cached, "cached": True})
     try:
         summary   = _wallet.all_accounts_summary()
         addrs     = _wallet.all_addresses()
@@ -303,6 +307,7 @@ def api_addresses():
                 a["unconfirmed"] = b["unconfirmed"]
                 a["has_balance"] = b["confirmed"] + b["unconfirmed"] > 0
 
+        _cache_set(cache_key, summary)
         return ok(groups=summary)
     except Exception as e:
         return err(str(e))
