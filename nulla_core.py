@@ -218,6 +218,13 @@ class BitcoinAddress:
         elif self.addr_type == "p2pkh":
             ver = MAINNET_P2PKH_VERSION if self.network == "mainnet" else TESTNET_P2PKH_VERSION
             return base58check_encode(ver + h160)
+        elif self.addr_type == "p2sh-p2wpkh":
+            # BIP49: P2SH wrapping P2WPKH — "3..." address
+            # redeemScript = OP_0 PUSH20 <hash160(pubkey)>
+            redeem = bytes([0x00, 0x14]) + h160
+            script_hash = hash160(redeem)
+            ver = MAINNET_P2SH_VERSION if self.network == "mainnet" else TESTNET_P2SH_VERSION
+            return base58check_encode(ver + script_hash)
         else:
             raise WalletError(f"Unknown address type: {self.addr_type}")
 
@@ -226,12 +233,24 @@ class BitcoinAddress:
         return self._address
 
     @property
+    def redeem_script(self) -> Optional[bytes]:
+        """P2SH redeemScript (only for p2sh-p2wpkh)."""
+        if self.addr_type == "p2sh-p2wpkh":
+            return bytes([0x00, 0x14]) + hash160(self.pubkey)
+        return None
+
+    @property
     def script_pubkey(self) -> bytes:
         h160 = hash160(self.pubkey)
         if self.addr_type == "p2wpkh":
             return bytes([0x00, 0x14]) + h160  # OP_0 PUSH20 <hash160>
         elif self.addr_type == "p2pkh":
             return bytes([0x76, 0xa9, 0x14]) + h160 + bytes([0x88, 0xac])
+        elif self.addr_type == "p2sh-p2wpkh":
+            # P2SH scriptPubKey: OP_HASH160 <hash160(redeemScript)> OP_EQUAL
+            redeem = bytes([0x00, 0x14]) + h160
+            sh = hash160(redeem)
+            return bytes([0xa9, 0x14]) + sh + bytes([0x87])
         raise WalletError("Unknown type")
 
     @property
@@ -331,19 +350,27 @@ class NullaWallet:
         return f"m/{purpose}'/0'/{account}'/{change}/{index}"
 
     def _derive_addresses(self, gap: int = None):
-        """Derive receiving (change=0) and change (change=1) addresses."""
+        """
+        Derive receiving (change=0) and change (change=1) addresses.
+        Three formats: BIP84 (p2wpkh), BIP49 (p2sh-p2wpkh), BIP44 (p2pkh).
+        """
         if self._seed is None:
             raise WalletError("No seed")
         gap = gap or self.DEFAULT_GAP
         for account in range(1):
             for change in range(2):
                 for idx in range(gap):
-                    # BIP84 — Native SegWit (preferred)
+                    # BIP84 — Native SegWit bc1q... (preferred)
                     p84 = self._path(84, account, change, idx)
                     if p84 not in self._addrs:
                         priv = derive_path(self._seed, p84)
                         self._addrs[p84] = BitcoinAddress(priv, "p2wpkh", self.network, p84)
-                    # BIP44 — Legacy
+                    # BIP49 — P2SH-SegWit 3... (compatible)
+                    p49 = self._path(49, account, change, idx)
+                    if p49 not in self._addrs:
+                        priv = derive_path(self._seed, p49)
+                        self._addrs[p49] = BitcoinAddress(priv, "p2sh-p2wpkh", self.network, p49)
+                    # BIP44 — Legacy 1... (old)
                     p44 = self._path(44, account, change, idx)
                     if p44 not in self._addrs:
                         priv = derive_path(self._seed, p44)
@@ -403,11 +430,68 @@ class NullaWallet:
         return self.default_address("p2wpkh").address
 
     def all_accounts_summary(self) -> List[dict]:
+        """All addresses grouped by type with labels."""
         self._require_unlocked()
-        seen = {}
+        TYPE_META = {
+            "p2wpkh":      {"label": "Native SegWit",  "prefix": "bc1q", "bip": "BIP84"},
+            "p2sh-p2wpkh": {"label": "P2SH-SegWit",    "prefix": "3",    "bip": "BIP49"},
+            "p2pkh":       {"label": "Legacy",          "prefix": "1",    "bip": "BIP44"},
+        }
+        seen: Dict[str, list] = {}
         for path, addr in self._addrs.items():
-            seen.setdefault(addr.addr_type, []).append(addr.to_dict())
-        return [{"type": k, "addresses": v} for k, v in seen.items()]
+            t = addr.addr_type
+            if t not in seen:
+                seen[t] = []
+            # Mark change addresses
+            is_change = "/1/" in path
+            d = addr.to_dict()
+            d["is_change"] = is_change
+            seen[t].append(d)
+        return [
+            {
+                "type": t,
+                **TYPE_META.get(t, {"label": t, "prefix": "", "bip": ""}),
+                "addresses": v,
+            }
+            for t, v in seen.items()
+        ]
+
+    def receiving_addresses_all_types(self) -> List["BitcoinAddress"]:
+        """All receiving addresses across all types — for gap limit scanning."""
+        self._require_unlocked()
+        return [
+            a for path, a in self._addrs.items()
+            if "/0/" in path  # change=0 = receiving
+        ]
+
+    def scan_gap_limit(self, electrum_client, gap: int = 20) -> int:
+        """
+        Electrum-style gap limit scan.
+        Derives addresses until gap consecutive unused addresses found.
+        Returns total number of addresses scanned.
+        """
+        self._require_unlocked()
+        for purpose, addr_type in [(84, "p2wpkh"), (49, "p2sh-p2wpkh"), (44, "p2pkh")]:
+            consecutive_empty = 0
+            idx = 0
+            while consecutive_empty < gap:
+                path = self._path(purpose, 0, 0, idx)
+                if path not in self._addrs:
+                    if self._seed is None:
+                        break
+                    priv = derive_path(self._seed, path)
+                    self._addrs[path] = BitcoinAddress(priv, addr_type, self.network, path)
+                addr = self._addrs[path]
+                try:
+                    history = electrum_client.get_history(addr.electrum_scripthash)
+                    if history:
+                        consecutive_empty = 0
+                    else:
+                        consecutive_empty += 1
+                except Exception:
+                    consecutive_empty += 1
+                idx += 1
+        return len(self._addrs)
 
     # ── Keystore: save ────────────────────────────────────────────────────────
 

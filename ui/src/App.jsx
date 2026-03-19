@@ -579,13 +579,145 @@ function ScreenSettings({ wallet, onLocked }) {
   );
 }
 
+// ── Addresses ────────────────────────────────────────────────────────────────
+function ScreenAddresses() {
+  const [groups, setGroups] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [scanning, setScanning] = useState(false);
+  const [scanMsg, setScanMsg] = useState("");
+  const [copied, setCopied] = useState("");
+  const [showChange, setShowChange] = useState(false);
+
+  const TYPE_COLOR = {
+    "p2wpkh":      T.accent,
+    "p2sh-p2wpkh": "#a78bfa",
+    "p2pkh":       T.muted,
+  };
+
+  const load = async () => {
+    setLoading(true);
+    const r = await api("/addresses");
+    if (r.ok) setGroups(r.groups || []);
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const doScan = async () => {
+    setScanning(true); setScanMsg("");
+    const r = await api("/scan", {});
+    setScanning(false);
+    setScanMsg(r.ok ? `✓ ${r.message}` : `✗ ${r.error}`);
+    if (r.ok) load();
+  };
+
+  const copy = (addr) => {
+    copyText(addr);
+    setCopied(addr);
+    setTimeout(() => setCopied(""), 1500);
+  };
+
+  return (
+    <div className="fade-in" style={{ paddingBottom: 80 }}>
+      <div style={{ padding: "14px 14px 10px", display: "flex",
+        alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontWeight: 700, fontSize: 15 }}>Addresses</div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button onClick={() => setShowChange(v => !v)}
+            style={{ background: showChange ? T.accentDim : "transparent",
+              color: showChange ? T.accent : T.muted, border: `1px solid ${T.border}`,
+              borderRadius: 4, padding: "4px 10px", fontSize: 11, cursor: "pointer" }}>
+            {showChange ? "hide change" : "show change"}
+          </button>
+          <Btn variant="ghost" onClick={doScan} disabled={scanning}
+            style={{ padding: "6px 12px", fontSize: 11 }}>
+            {scanning ? <Spinner /> : "⟳ scan"}
+          </Btn>
+        </div>
+      </div>
+
+      {scanMsg && (
+        <div style={{ margin: "0 14px 10px", padding: "8px 12px", borderRadius: 4,
+          background: scanMsg.startsWith("✓") ? "rgba(0,229,160,0.08)" : "rgba(255,82,82,0.08)",
+          color: scanMsg.startsWith("✓") ? T.green : T.red, fontSize: 12 }}>
+          {scanMsg}
+        </div>
+      )}
+
+      {loading ? (
+        <div style={{ textAlign: "center", padding: 40 }}><Spinner /></div>
+      ) : groups.map(group => {
+        const addrs = group.addresses.filter(a => showChange || !a.is_change);
+        if (!addrs.length) return null;
+        return (
+          <div key={group.type} style={{ padding: "0 10px 16px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8,
+              padding: "6px 4px 8px" }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%",
+                background: TYPE_COLOR[group.type] || T.muted }} />
+              <span style={{ fontSize: 11, fontWeight: 600,
+                color: TYPE_COLOR[group.type] || T.muted,
+                letterSpacing: "0.08em" }}>
+                {group.label}
+              </span>
+              <span style={{ fontSize: 10, color: T.muted }}>{group.bip}</span>
+            </div>
+
+            {addrs.map((a, i) => {
+              const total = (a.confirmed || 0) + (a.unconfirmed || 0);
+              const isCopied = copied === a.address;
+              return (
+                <div key={i} style={{ background: T.surface,
+                  border: `1px solid ${a.has_balance ? TYPE_COLOR[group.type] + "33" : T.border}`,
+                  borderRadius: 5, padding: "10px 12px", marginBottom: 6,
+                  opacity: a.is_change ? 0.7 : 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between",
+                    alignItems: "flex-start", gap: 8 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 11, wordBreak: "break-all",
+                        lineHeight: 1.6, color: a.has_balance ? T.text : T.muted,
+                        fontFamily: T.font }}>
+                        {a.address}
+                      </div>
+                      <div style={{ fontSize: 10, color: T.muted, marginTop: 3 }}>
+                        {a.path}
+                        {a.is_change && <span style={{ marginLeft: 6, color: T.yellow,
+                          background: "rgba(255,209,102,0.1)", padding: "1px 6px",
+                          borderRadius: 3 }}>change</span>}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right", flexShrink: 0 }}>
+                      {total > 0 && (
+                        <div style={{ fontWeight: 600, fontSize: 12,
+                          color: TYPE_COLOR[group.type] }}>
+                          {fmtBtc(total)}
+                        </div>
+                      )}
+                      <button onClick={() => copy(a.address)}
+                        style={{ background: "none", color: isCopied ? T.green : T.muted,
+                          fontSize: 11, cursor: "pointer", marginTop: 4 }}>
+                        {isCopied ? "✓" : "copy"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
 // ── Navigation ────────────────────────────────────────────────────────────────
 const NAV = [
-  { id: "dashboard", label: "Home",    icon: "◈" },
-  { id: "send",      label: "Send",    icon: "↑" },
-  { id: "receive",   label: "Receive", icon: "↓" },
-  { id: "history",   label: "History", icon: "≡" },
-  { id: "settings",  label: "Config",  icon: "⚙" },
+  { id: "dashboard",  label: "Home",    icon: "◈" },
+  { id: "send",       label: "Send",    icon: "↑" },
+  { id: "receive",    label: "Receive", icon: "↓" },
+  { id: "addresses",  label: "Addrs",   icon: "⊞" },
+  { id: "settings",   label: "Config",  icon: "⚙" },
 ];
 
 function BottomNav({ active, onChange }) {
@@ -659,6 +791,7 @@ export default function App() {
         {tab === "send"      && <ScreenSend />}
         {tab === "receive"   && <ScreenReceive wallet={wallet} />}
         {tab === "history"   && <ScreenHistory />}
+        {tab === "addresses" && <ScreenAddresses />}
         {tab === "settings"  && <ScreenSettings wallet={wallet} onLocked={() => { setWallet(null); setScreen("unlock"); }} />}
       </div>
       <BottomNav active={tab} onChange={setTab} />

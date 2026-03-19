@@ -273,6 +273,54 @@ def api_info():
     )
 
 
+# ── API: addresses ───────────────────────────────────────────────────────────
+
+@app.route("/api/addresses")
+@require_unlocked
+def api_addresses():
+    """All addresses with balances, grouped by type."""
+    try:
+        summary   = _wallet.all_accounts_summary()
+        addrs     = _wallet.all_addresses()
+        sh_map    = {a.electrum_scripthash: a for a in addrs}
+        balances  = _query_parallel(list(sh_map.keys()), "blockchain.scripthash.get_balance")
+
+        # Build addr→balance lookup
+        bal_map = {}
+        for sh, b in balances.items():
+            addr_obj = sh_map.get(sh)
+            if addr_obj:
+                bal_map[addr_obj.address] = {
+                    "confirmed":   (b or {}).get("confirmed", 0),
+                    "unconfirmed": (b or {}).get("unconfirmed", 0),
+                }
+
+        # Inject balances into summary
+        for group in summary:
+            for a in group["addresses"]:
+                b = bal_map.get(a["address"], {"confirmed": 0, "unconfirmed": 0})
+                a["confirmed"]   = b["confirmed"]
+                a["unconfirmed"] = b["unconfirmed"]
+                a["has_balance"] = b["confirmed"] + b["unconfirmed"] > 0
+
+        return ok(groups=summary)
+    except Exception as e:
+        return err(str(e))
+
+
+@app.route("/api/scan", methods=["POST"])
+@require_unlocked
+def api_scan():
+    """Gap limit scan — discover all used addresses like Electrum does on restore."""
+    try:
+        el      = _get_electrum()
+        total   = _wallet.scan_gap_limit(el, gap=20)
+        _cache_clear()
+        return ok(scanned=total, message=f"Scanned {total} addresses")
+    except Exception as e:
+        return err(str(e))
+
+
 # ── API: balance ──────────────────────────────────────────────────────────────
 
 @app.route("/api/balance")
